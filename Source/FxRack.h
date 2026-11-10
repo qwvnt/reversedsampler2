@@ -110,7 +110,8 @@ private:
         int reversePhase = 0, delayTime = 0, previousReverseLength = 0, lastType = -1, lastStyle = -1, lastVintage = -1;
         int grainPos = 0, grainValid = 0, grainLength = 0, lastReflections = 0, lastDirection = -1;
         float grainFilter[maxDelayReflections][2][4]{}; int grainOffset[maxDelayReflections][2]{};
-        float previousTape[2]{};
+        float previousTape[2]{}; double previousTapePrimitive[2]{};
+        float tapeToneFor = -1.0f, tapeTone = 0.0f;   // the tape tone coefficient, for the Bias value it was computed from
         bool wasEnabled = false;
         int silentSamples = 0;   // idle gate: input and output below -120 dB for this long
         float low[2]{}, high[2]{}, tone[2]{}, brown[2]{};

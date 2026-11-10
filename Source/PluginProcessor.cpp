@@ -758,6 +758,48 @@ void ReverseSamplerProcessor::setFxType (int slot, int newType)
     commitPendingEdit();
 }
 
+void ReverseSamplerProcessor::applyFxPreset (int slot, const rs::FxPreset& preset)
+{
+    if (! juce::isPositiveAndBelow (slot, rs::fxSlots) || ! juce::isPositiveAndBelow (preset.type, rs::numFxTypes))
+        return;
+    commitPendingEdit();
+    const auto set = [this, slot] (const char* name, float value) {
+        if (auto* param = apvts.getParameter (rs::fxID (slot, name)))
+        {
+            param->beginChangeGesture();
+            param->setValueNotifyingHost (param->convertTo0to1 (value));
+            param->endChangeGesture();
+        }
+    };
+    // Requested before and after (see FxRackDSP::requestReset): the running effect fades out with
+    // the values it had, then the preset starts clean, even when only the knobs differ.
+    const bool typeChanges = juce::roundToInt (apvts.getRawParameterValue (rs::fxID (slot, "type"))->load()) != preset.type;
+    fxRack.requestReset (slot);
+    set ("type", (float) preset.type);
+    for (const auto* name : rs::fxParameterNames)
+    {
+        const juce::String id (name);
+        if (id == "type" || id == "a" || id == "b")
+            continue;
+        if (auto* param = apvts.getParameter (rs::fxID (slot, name)))
+            set (name, param->convertFrom0to1 (param->getDefaultValue()));
+    }
+    const char* shared[] { "p1", "p2", "p3", "mix" };
+    for (int k = 0; k < 4; ++k)
+        set (shared[k], rs::fxTypeDefaults[preset.type][k]);
+    for (const auto& value : preset.values)
+        set (value.name, value.value);
+    fxRack.requestReset (slot);
+    if (typeChanges)
+        for (int row = 0; row < rs::mod::numRows; ++row)
+        {
+            const auto destination = modMatrix.readRow (row).destination;
+            if (destination > 0 && rs::ModMatrix::destinations()[(size_t) destination].fxSlot == slot)
+                resetModulationRow (row);
+        }
+    commitPendingEdit();
+}
+
 void ReverseSamplerProcessor::setParameterAsGesture (const juce::String& id, float value)
 {
     if (auto* param = apvts.getParameter (id))

@@ -329,9 +329,10 @@ public:
     }
     void resetLayer (int layer) noexcept { for (auto& c : channels[(size_t) std::clamp (layer, 0, 1)]) c = Channel {}; }
     void setTargets (const Settings& s, bool snap) noexcept {
+        const auto finite = [] (float v, float fallback) { return std::isfinite (v) ? v : fallback; };   // NaN would poison every filter for good
         target = s; target.type = std::clamp (s.type, 0, numTypes - 1);
-        target.drive01 = std::clamp (s.drive01, 0.0f, 1.0f); target.tone01 = std::clamp (s.tone01, 0.0f, 1.0f);
-        target.mix = std::clamp (s.mix, 0.0f, 1.0f); target.output = std::max (0.0f, s.output);
+        target.drive01 = std::clamp (finite (s.drive01, 0.3f), 0.0f, 1.0f); target.tone01 = std::clamp (finite (s.tone01, 0.5f), 0.0f, 1.0f);
+        target.mix = std::clamp (finite (s.mix, 1.0f), 0.0f, 1.0f); target.output = std::max (0.0f, finite (s.output, 1.0f));
         if (snap) reset();
     }
     // ch: 4 channel pointers (layer 1 L/R, layer 2 L/R), processed in place.

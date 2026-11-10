@@ -5,6 +5,7 @@
 
 #include "LayerBus.h"
 #include "FxRack.h"
+#include "FxPresets.h"
 #include "SamplerEngine.h"
 #include "ModMatrix.h"
 
@@ -180,6 +181,9 @@ public:
     void swapFxSlots (int first, int second);
     // Editor type change: sets the type, then loads the neutral p1..p3/mix of the new effect, as one undo step.
     void setFxType (int slot, int newType);
+    // Loads a factory preset into a slot as one undo step: the preset's type, every other setting of
+    // the slot at its default, then the preset's values. The A/B routing is kept.
+    void applyFxPreset (int slot, const rs::FxPreset& preset);
     rs::comp::Meters& getCompressorMeters (int slot) noexcept { return fxRack.compressorMeters (slot); }
     rs::SpectrumTap& getSpectrumTap (int slot) noexcept { return fxRack.spectrumTap (slot); }
 

@@ -15,6 +15,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 #if defined(__SSE__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 1)
  #include <xmmintrin.h>
@@ -173,6 +174,7 @@ public:
             oc[(size_t) i] *= g; os[(size_t) i] *= g;
         }
     }
+    template <bool Settled = false>
     void process (const FdnParams<N>& a, const FdnParams<N>& b, float t, float inL, float inR, float& outL, float& outR) noexcept {
         float v[N];
         const float depth = b.depth, aLo = b.aLo, aHi = b.aHi;
@@ -180,7 +182,7 @@ public:
             const size_t j = (size_t) i;
             const float c = oc[j], s = os[j];
             oc[j] = c * rc[j] - s * rsn[j]; os[j] = s * rc[j] + c * rsn[j];
-            const float x = line[j].read (a.len[j] + (b.len[j] - a.len[j]) * t + depth * s);
+            const float x = line[j].read ((Settled ? a.len[j] : a.len[j] + (b.len[j] - a.len[j]) * t) + depth * s);
             lo[j] += aLo * (x - lo[j]); hi[j] += aHi * (x - hi[j]);
             v[i] = b.gl[j] * lo[j] + b.gm[j] * (hi[j] - lo[j]) + b.gh[j] * (x - hi[j]);
         }
@@ -225,8 +227,9 @@ public:
         bw = loL = hiL = loR = hiR = endL = endR = 0.0f; oc = 1.0f; os = 0.0f; dz.fill (0.0f);
     }
     void renormalise() noexcept { const float g = 1.5f - 0.5f * (oc * oc + os * os); oc *= g; os *= g; }
+    template <bool Settled = false>
     void process (const PlateParams& a, const PlateParams& b, float t, float x, float& outL, float& outR) noexcept {
-        const float k = a.k + (b.k - a.k) * t;
+        const float k = Settled ? a.k : a.k + (b.k - a.k) * t;
         bw += b.inLp * (x - bw);
         float v = bw;
         for (auto& z : dz) { const float y = disp * v + z; z = v - disp * y; v = y; }
@@ -308,18 +311,19 @@ public:
     void reset() noexcept {
         current = target; mode = target.mode;
         for (int l = 0; l < 2; ++l) resetLayer (l);
-        computeFrame (current, mode, to); from = to;
-        duckFrom = duckTo = 1.0f; remaining = 0; silent = false;
+        computeFrame (current, mode, to); from = to; frameFor = current;
+        duckFrom = duckTo = 1.0f; remaining = 0; silent = false; framesEqual = false;
     }
     void resetLayer (int layer) noexcept { clearLayer (layers[(size_t) std::clamp (layer, 0, 1)]); }
     void setTargets (const Settings& s, bool snap) noexcept {
+        const auto finite = [] (float v, float fallback) { return std::isfinite (v) ? v : fallback; };   // NaN would never leave the tails
         target = s;
         target.mode = std::clamp (s.mode, 0, numModes - 1);
-        target.size01 = std::clamp (s.size01, 0.0f, 1.0f); target.decay01 = std::clamp (s.decay01, 0.0f, 1.0f);
-        target.tone01 = std::clamp (s.tone01, 0.0f, 1.0f); target.mix = std::clamp (s.mix, 0.0f, 1.0f);
-        target.character01 = std::clamp (s.character01, 0.0f, 1.0f);
-        target.preDelayMs = std::clamp (s.preDelayMs, 0.0f, maxPreDelayMs);
-        target.lowCutHz = std::clamp (s.lowCutHz, minLowCutHz, maxLowCutHz);
+        target.size01 = std::clamp (finite (s.size01, 0.5f), 0.0f, 1.0f); target.decay01 = std::clamp (finite (s.decay01, 0.5f), 0.0f, 1.0f);
+        target.tone01 = std::clamp (finite (s.tone01, 0.5f), 0.0f, 1.0f); target.mix = std::clamp (finite (s.mix, 0.5f), 0.0f, 1.0f);
+        target.character01 = std::clamp (finite (s.character01, 0.5f), 0.0f, 1.0f);
+        target.preDelayMs = std::clamp (finite (s.preDelayMs, 10.0f), 0.0f, maxPreDelayMs);
+        target.lowCutHz = std::clamp (finite (s.lowCutHz, 80.0f), minLowCutHz, maxLowCutHz);
         if (snap) reset();
     }
     int currentMode() const noexcept { return mode; }
@@ -646,10 +650,12 @@ private:
     void nextTick() noexcept {
         from = to;
         duckFrom = duckTo;
+        bool switched = false;
         if (target.mode != mode && duckFrom <= 0.0f) {   // wet is silent: switch algorithm and start clean
             mode = target.mode;
             for (auto& z : layers) clearLayer (z);
             computeFrame (current, mode, from);
+            switched = true;
         }
         const auto step = [] (float& v, float t, float k) { v += (t - v) * k; if (std::abs (t - v) < 1.0e-5f) v = t; };
         step (current.size01, target.size01, smoothSize);
@@ -660,9 +666,11 @@ private:
         step (current.preDelayMs, target.preDelayMs, smoothPre);
         step (current.mix, target.mix, smoothMix);
         current.mode = mode;
-        computeFrame (current, mode, to);
+        bool recomputed = false;
+        if (! sameFrame (current, frameFor)) { computeFrame (current, mode, to); frameFor = current; recomputed = true; }
         const float duckTarget = target.mode != mode ? 0.0f : 1.0f;
         duckTo = duckTarget > duckFrom ? std::min (duckTarget, duckFrom + duckPerTick) : std::max (duckTarget, duckFrom - duckPerTick);
+        framesEqual = ! recomputed && ! switched && std::memcmp (&duckFrom, &duckTo, sizeof (float)) == 0;
         silent = from.wet == 0.0f && to.wet == 0.0f;
         for (auto& z : layers) { z.main.renormalise(); z.attack.renormalise(); z.plateTank.renormalise(); }
         remaining = tick;
@@ -671,20 +679,31 @@ private:
     void run (Layer& z, float* l, float* r, int len, int offset) noexcept {
         if (silent) { z.stale = true; return; }          // Mix 0: dry is bit-exact, skip all work
         if (z.stale) clearLayer (z);                      // do not replay old audio when the wet comes back
+        if (framesEqual) runSettled<true> (z, l, r, len, offset); else runSettled<false> (z, l, r, len, offset);
+    }
+    // Settled: `from` and `to` are the same frame, so every per-sample glide is skipped (lerp (a, a, t) is a).
+    template <bool Settled>
+    void runSettled (Layer& z, float* l, float* r, int len, int offset) noexcept {
         switch (mode) {
-            case room:     runMode<room> (z, l, r, len, offset); break;
-            case plate:    runMode<plate> (z, l, r, len, offset); break;
-            case ambience: runMode<ambience> (z, l, r, len, offset); break;
-            case terrain:  runMode<terrain> (z, l, r, len, offset); break;
-            case bloom:    runMode<bloom> (z, l, r, len, offset); break;
-            default:       runMode<shimmer> (z, l, r, len, offset); break;
+            case room:     runMode<room, Settled> (z, l, r, len, offset); break;
+            case plate:    runMode<plate, Settled> (z, l, r, len, offset); break;
+            case ambience: runMode<ambience, Settled> (z, l, r, len, offset); break;
+            case terrain:  runMode<terrain, Settled> (z, l, r, len, offset); break;
+            case bloom:    runMode<bloom, Settled> (z, l, r, len, offset); break;
+            default:       runMode<shimmer, Settled> (z, l, r, len, offset); break;
         }
     }
 
-    static float lerp (float a, float b, float t) noexcept { return a + (b - a) * t; }
+    // A settled reverb recomputes nothing: the frame only changes when a setting does.
+    static bool sameFrame (const Settings& a, const Settings& b) noexcept {
+        const auto same = [] (float x, float y) { return std::memcmp (&x, &y, sizeof (float)) == 0; };
+        return a.mode == b.mode && same (a.size01, b.size01) && same (a.decay01, b.decay01) && same (a.tone01, b.tone01) && same (a.mix, b.mix)
+            && same (a.preDelayMs, b.preDelayMs) && same (a.lowCutHz, b.lowCutHz) && same (a.character01, b.character01);
+    }
 
-    template <int M>
+    template <int M, bool Settled>
     void runMode (Layer& z, float* lch, float* rch, int len, int offset) noexcept {
+        const auto lerp = [] (float a, float b, float t) noexcept { if constexpr (Settled) { (void) b; (void) t; return a; } else return a + (b - a) * t; };
         const Frame& a = from; const Frame& b = to;
         const float invTick = 1.0f / (float) tick;
         for (int i = 0; i < len; ++i) {
@@ -717,7 +736,7 @@ private:
                         tr = detail::allpass (z.inAp[1][uj], tr, lerp (a.inLen[1][uj], b.inLen[1][uj], t), b.inG);
                     }
                     float ol = 0.0f, orr = 0.0f;
-                    z.main.process (a.main, b.main, t, tl, tr, ol, orr);
+                    z.main.template process<Settled> (a.main, b.main, t, tl, tr, ol, orr);
                     const float er = lerp (a.er, b.er, t), tg = lerp (a.tail, b.tail, t);
                     wl = er * nl + tg * ol; wr = er * nr + tg * orr;
                 } else if constexpr (M == ambience) {
@@ -727,7 +746,7 @@ private:
                         nr = detail::allpass (z.erAp[1][uj], nr, lerp (a.erLen[1][uj], b.erLen[1][uj], t), b.erG[uj]);
                     }
                     float ol = 0.0f, orr = 0.0f;
-                    z.main.process (a.main, b.main, t, nl, nr, ol, orr);
+                    z.main.template process<Settled> (a.main, b.main, t, nl, nr, ol, orr);
                     const float er = lerp (a.er, b.er, t), tg = lerp (a.tail, b.tail, t);
                     wl = er * nl + tg * ol; wr = er * nr + tg * orr;
                 } else {   // terrain: later echoes are scattered more
@@ -739,7 +758,7 @@ private:
                     }
                     float ol = 0.0f, orr = 0.0f;
                     // The wash is fed by every reflection (near ones less), so it carries the decay past the last echo.
-                    z.main.process (a.main, b.main, t, (0.5f * nl + fl) * b.tailSend, (0.5f * nr + fr) * b.tailSend, ol, orr);
+                    z.main.template process<Settled> (a.main, b.main, t, (0.5f * nl + fl) * b.tailSend, (0.5f * nr + fr) * b.tailSend, ol, orr);
                     const float er = lerp (a.er, b.er, t), tg = lerp (a.tail, b.tail, t);
                     float lo = 0.0f, hi = 0.0f;
                     detail::svf (b.shLow, z.shLp[0], er * (nl + fl) + tg * ol, wl, hi);
@@ -748,7 +767,7 @@ private:
             } else if constexpr (M == plate) {
                 const float x = 0.5f * (z.in[0].read (pre) + z.in[1].read (pre));
                 float ol = 0.0f, orr = 0.0f;
-                z.plateTank.process (a.plate, b.plate, t, x, ol, orr);
+                z.plateTank.template process<Settled> (a.plate, b.plate, t, x, ol, orr);
                 const float tg = lerp (a.tail, b.tail, t);
                 wl = tg * ol; wr = tg * orr;
             } else {   // bloom, shimmer
@@ -771,12 +790,12 @@ private:
                 float ol = 0.0f, orr = 0.0f;
                 if constexpr (M == bloom) {
                     float al = 0.0f, ar = 0.0f;
-                    z.attack.process (a.attack, b.attack, t, tl, tr, al, ar);
-                    z.main.process (a.main, b.main, t, al * b.attackGain, ar * b.attackGain, ol, orr);
+                    z.attack.template process<Settled> (a.attack, b.attack, t, tl, tr, al, ar);
+                    z.main.template process<Settled> (a.main, b.main, t, al * b.attackGain, ar * b.attackGain, ol, orr);
                     const float tg = lerp (a.tail, b.tail, t);
                     wl = tg * ol; wr = tg * orr;
                 } else {
-                    z.main.process (a.main, b.main, t, tl, tr, ol, orr);
+                    z.main.template process<Settled> (a.main, b.main, t, tl, tr, ol, orr);
                     const float nl = ol * b.shimNorm, nr = orr * b.shimNorm;   // unit-energy tank output
                     float lo = 0.0f, hi = 0.0f, bl = 0.0f, br = 0.0f;
                     detail::svf (b.shLow, z.shLp[0], nl, lo, hi); detail::svf (shimHigh, z.shHp[0], lo, lpTmp, bl);
@@ -814,9 +833,9 @@ private:
     static constexpr int bloomTaps = 16;
     std::array<std::array<double, bloomTaps>, 2> bloomJitter {}, bloomSign {};
     detail::Svf shimHigh;
-    Settings target, current;
+    Settings target, current, frameFor;   // frameFor: the settings `to` was last computed from
     int mode = room, remaining = 0;
-    bool silent = false;
+    bool silent = false, framesEqual = false;   // framesEqual: from == to this tick, no glide to compute
     float smoothFast = 0.1f, smoothSize = 0.01f, smoothPre = 0.02f, smoothMix = 0.1f, duckPerTick = 0.05f, duckFrom = 1.0f, duckTo = 1.0f;
     Frame from, to;
     std::array<Layer, 2> layers;

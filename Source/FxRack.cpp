@@ -1,19 +1,25 @@
 #include "FxRack.h"
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 namespace rs {
 namespace {
 // First-order antiderivative anti-aliasing: integrate the nonlinearity between
 // adjacent samples rather than generating unfiltered harmonics at a point.
-float saturate (float x, float& previous) noexcept {
+// log(cosh(v)), constant cancels in the difference.
+double saturatePrimitive (double v) noexcept {
+    const double m = std::abs (v);
+    return m + std::log1p (std::exp (-2.0 * m));
+}
+// previousPrimitive caches saturatePrimitive (previous): the previous sample's value is reused
+// instead of being evaluated twice (exp + log1p per sample per channel).
+float saturate (float x, float& previous, double& previousPrimitive) noexcept {
     const double a = x, b = previous;
-    previous = x;
-    const auto primitive = [] (double v) {
-        const double m = std::abs (v);
-        return m + std::log1p (std::exp (-2.0 * m)); // log(cosh(v)), constant cancels
-    };
-    return std::abs (a-b) > 1.0e-4 ? (float) ((primitive (a) - primitive (b)) / (a-b))
+    const double primitiveA = saturatePrimitive (a);
+    const double primitiveB = previousPrimitive;
+    previous = x; previousPrimitive = primitiveA;
+    return std::abs (a-b) > 1.0e-4 ? (float) ((primitiveA - primitiveB) / (a-b))
                                  : (float) std::tanh (0.5 * (a+b));
 }
 // Four-point Hermite interpolation. Integer delays remain exactly transparent.
@@ -51,6 +57,8 @@ void FxRackDSP::State::reset() noexcept {
     grainPos = grainValid = lastReflections = 0; lastDirection = -1;
     for (auto& stage : grainFilter) for (auto& channel : stage) std::fill (std::begin (channel), std::end (channel), 0.0f);
     std::fill (std::begin (previousTape), std::end (previousTape), 0.0f);
+    std::fill (std::begin (previousTapePrimitive), std::end (previousTapePrimitive), saturatePrimitive (0.0));
+    tapeToneFor = -1.0f; tapeTone = 0.0f;
     delayFrom = delayTo = 0.0f; delayFade = 1.0f; headTarget = headDelay = 0.0;
     delayTime = previousReverseLength = 0; pitchPhase = wowPhase = flutterPhase = 0.0; previousPitchPhase = -1.0;
     for (auto& stage : grainOffset) for (auto& head : stage) head = 0;
@@ -342,6 +350,7 @@ void FxRackDSP::runSlot (int i, const Parameters& p, juce::AudioBuffer<float>& l
     const int grainDuration = juce::jmax (8, (int) std::round (rate * juce::jlimit (150.0f, 700.0f, p.amSplice->load()) * 0.0005));
     const bool grainReverse = cfg.direction != 0;
     const double headCoeff = delayConstants.headCoeff;
+    const float delayFadeStep = (float) (1.0 / (0.03 * rate));
 
     for (int layer = 0; layer < 2; ++layer) {
         auto& s = states[(size_t)i][(size_t)layer];
@@ -399,7 +408,7 @@ void FxRackDSP::runSlot (int i, const Parameters& p, juce::AudioBuffer<float>& l
             if (s.delayFade >= 1.0f && s.delayTo != (float) delayLength) {
                 s.delayFrom = s.delayTo; s.delayTo = (float) delayLength; s.delayFade = 0.0f;
             }
-            const float delayBlend = 0.5f - 0.5f*std::cos (juce::MathConstants<float>::pi*s.delayFade);
+            const float delayBlend = s.delayFade >= 1.0f ? 1.0f : 0.5f - 0.5f*std::cos (juce::MathConstants<float>::pi*s.delayFade);
             float* outs[2] = { left+n, right+n }; float* rings[2] = { dl, dr }; float* inputs[2] { il, ir }; float* grainRings[2] { grainLeft, grainRight };
             const float x[2] { *outs[0], *outs[1] }; float wet[2] { x[0], x[1] };
             if (type == 1) {
@@ -521,7 +530,11 @@ void FxRackDSP::runSlot (int i, const Parameters& p, juce::AudioBuffer<float>& l
                                   + std::sin (s.flutterPhase) * rate * 0.000035)
                         : 0.0f;
                     const float d = juce::jlimit (1.0f, (float) (size - 2), smoothedDelay + mod);
-                    const float tapeTone = coef (1500.0f * std::pow (12.0f, tapeBias));
+                    if (std::memcmp (&tapeBias, &s.tapeToneFor, sizeof (float)) != 0) {   // pow + exp only while Bias moves
+                        s.tapeTone = coef (1500.0f * std::pow (12.0f, tapeBias));
+                        s.tapeToneFor = tapeBias;
+                    }
+                    const float tapeTone = s.tapeTone;
                     for (int ch=0; ch<2; ++ch) {
                         const float delayed = style == 1 ? readDelay (rings[ch], size, s.pos, s.valid, d)
                             : (1.0f-delayBlend)*readDelay (rings[ch], size, s.pos, s.valid, s.delayFrom)
@@ -529,12 +542,12 @@ void FxRackDSP::runSlot (int i, const Parameters& p, juce::AudioBuffer<float>& l
                         if (style == 1) {
                             s.tone[ch] += tapeTone * (delayed - s.tone[ch]);
                             const float saturation = 1.0f + 0.5f * (1.0f - tapeBias);
-                            wet[ch] = saturate (s.tone[ch] * saturation, s.previousTape[ch]) / saturation;
+                            wet[ch] = saturate (s.tone[ch] * saturation, s.previousTape[ch], s.previousTapePrimitive[ch]) / saturation;
                         } else if (vintage) {
                             // Gentle bandwidth/saturation, without mismatched encoder
                             // and decoder envelopes that pump the first repeat.
                             s.tone[ch] += replicaTone * (delayed - s.tone[ch]);
-                            wet[ch] = saturate (s.tone[ch] * 0.75f, s.previousTape[ch]) / 0.75f;
+                            wet[ch] = saturate (s.tone[ch] * 0.75f, s.previousTape[ch], s.previousTapePrimitive[ch]) / 0.75f;
                         } else wet[ch] = delayed;
                         if (style == 2) {
                             s.brown[ch] += brownTone * (wet[ch] - s.brown[ch]);
@@ -549,7 +562,7 @@ void FxRackDSP::runSlot (int i, const Parameters& p, juce::AudioBuffer<float>& l
                         if (s.flutterPhase >= juce::MathConstants<double>::twoPi) s.flutterPhase -= juce::MathConstants<double>::twoPi;
                     }
                 }
-                s.delayFade = juce::jmin (1.0f, s.delayFade + (float) (1.0 / (0.03 * rate)));
+                s.delayFade = juce::jmin (1.0f, s.delayFade + delayFadeStep);
                 if (++s.pos >= size) s.pos = 0;
                 s.valid = juce::jmin (size, s.valid + 1);
             }

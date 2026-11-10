@@ -1431,6 +1431,46 @@ static void testUiModulation (const juce::File& a, const juce::File& b)
     }
 }
 
+static void testFxPresets()
+{
+    ReverseSamplerProcessor p;
+    auto& state = p.getValueTreeState();
+    const auto value = [&] (int slot, const char* name) { return state.getRawParameterValue (rs::fxID (slot, name))->load(); };
+    int perType[rs::numFxTypes] {};
+    bool allValid = true, allLand = true, keepRouting = true, restoreDefaults = true;
+    for (size_t k = 0; k < rs::numFxPresets; ++k)
+    {
+        const auto& preset = rs::fxPresets[k];
+        if (! juce::isPositiveAndBelow (preset.type, rs::numFxTypes) || preset.type == 0) { allValid = false; continue; }
+        ++perType[preset.type];
+        const int slot = (int) (k % rs::fxSlots);
+        setParam (p, rs::fxID (slot, "b"), 0.0f);
+        setParam (p, rs::fxID (slot, "diffusion"), 77.0f);   // not part of any preset: must return to its default
+        p.applyFxPreset (slot, preset);
+        if ((int) std::round (value (slot, "type")) != preset.type) allLand = false;
+        for (const auto& v : preset.values)
+        {
+            auto* param = state.getParameter (rs::fxID (slot, v.name));
+            if (param == nullptr) { allValid = false; continue; }
+            const float got = param->convertFrom0to1 (param->getValue());
+            if (std::abs (got - v.value) > 0.051f + 0.001f * std::abs (v.value)) { allLand = false; std::cout << "    preset " << preset.name << ": " << v.name << " = " << got << ", wanted " << v.value << "\n"; }
+        }
+        if (value (slot, "b") >= 0.5f) keepRouting = false;
+        bool diffusionInPreset = false;
+        for (const auto& v : preset.values) if (juce::String (v.name) == "diffusion") diffusionInPreset = true;
+        if (! diffusionInPreset && std::abs (value (slot, "diffusion")) > 1.0e-3f) restoreDefaults = false;
+        setParam (p, rs::fxID (slot, "b"), 1.0f);
+    }
+    bool enough = true;
+    for (int t = 1; t < rs::numFxTypes; ++t) if (perType[t] < 5) enough = false;
+    CHECK (allValid, "every FX preset names an effect type and existing parameters");
+    CHECK (enough, "at least 5 presets for every effect type");
+    CHECK (allLand, "every preset value lands on its parameter (within the parameter's step)");
+    CHECK (keepRouting, "a preset keeps the slot's A/B routing");
+    CHECK (restoreDefaults, "a preset restores the settings it does not mention to their defaults");
+    CHECK (p.canUndo(), "a preset is an undo step");
+}
+
 static void testFxRack (const juce::File& a, const juce::File& b)
 {
     std::cout << "FX rack\n";
@@ -1803,7 +1843,7 @@ static void testDelayModes (const juce::File& sample)
     CHECK ((int)q.getValueTreeState().getRawParameterValue(rs::fxID(1,"type"))->load() == 1 && (int)q.getValueTreeState().getRawParameterValue(rs::fxID(1,"delayStyle"))->load() == 2 && q.getValueTreeState().getRawParameterValue(rs::fxID(1,"sync"))->load() < 0.5f, "0.7 FX states preserve existing slots and initialize new controls");
 }
 
-static void benchmarkScene (int timeMode, bool withFx, size_t maxHeld = 3)
+static void benchmarkScene (int timeMode, bool withFx, size_t maxHeld = 3, bool heavyFx = false)
 {
     const auto la = tmp ("scene_flute_12s.wav"), lb = tmp ("scene_fragment_3s.wav");
     if (! la.existsAsFile()) writeTone (la, 523.0, 12.0, 0.4f, 44100.0, 2);
@@ -1813,7 +1853,14 @@ static void benchmarkScene (int timeMode, bool withFx, size_t maxHeld = 3)
     setParam (*p, L (0, ParamIDs::reverse), 1.0f);
     setParam (*p, ParamIDs::attack, 5.0f); setParam (*p, ParamIDs::release, 1.0f);
     const auto set = [&] (int slot, const char* name, float v) { setParam (*p, rs::fxID (slot, name), v); };
-    if (withFx) {
+    if (withFx && heavyFx) {
+    // The most expensive setting of every effect, both layers: Tape drive, Classic chorus, Shimmer, Tape delay, Vintage compressor.
+    p->setFxType (0, 3); set (0, "driveType", (float) rs::drive::tape); set (0, "p1", 60);
+    p->setFxType (1, 5); set (1, "chModel", (float) rs::chorus::classic); set (1, "chHQ", 1);
+    p->setFxType (2, 4); set (2, "rvMode", (float) rs::reverb::shimmer); set (2, "p1", 60); set (2, "p2", 70); set (2, "rvChar", 70);
+    p->setFxType (3, 1); set (3, "delayStyle", 1); set (3, "p2", 50); set (3, "mix", 40);
+    p->setFxType (4, 6); set (4, "cpMode", (float) rs::comp::vintage); set (4, "cpTime", (float) rs::comp::opto); set (4, "p1", 40);
+    } else if (withFx) {
     p->setFxType (0, 3); set (0, "a", 0); set (0, "p1", 26); set (0, "p2", 100);
     p->setFxType (1, 5); set (1, "a", 0); set (1, "chModel", (float) rs::chorus::sine); set (1, "p2", 100); set (1, "chFeedback", -28); set (1, "p3", 100); set (1, "mix", 26);
     p->setFxType (2, 4); set (2, "rvMode", 4); set (2, "p1", 28); set (2, "p2", 60);
@@ -1846,7 +1893,7 @@ static void benchmarkScene (int timeMode, bool withFx, size_t maxHeld = 3)
         auto sorted = times; std::sort (sorted.begin(), sorted.end());
         const double budget = 1000.0 * bs / rate;
         int over = 0; for (auto t : times) if (t > 0.5 * budget) ++over;
-        std::cout << "    scene " << (timeMode == 0 ? "Stretch " : "Resample") << (withFx ? " +FX" : " dry") << " held " << maxHeld << " block " << bs << ": avg " << juce::String (100.0 * total / (blocks * budget), 1) << " % of one core, p99 "
+        std::cout << "    scene " << (timeMode == 0 ? "Stretch " : "Resample") << (withFx ? (heavyFx ? " +heavyFX" : " +FX") : " dry") << " held " << maxHeld << " block " << bs << ": avg " << juce::String (100.0 * total / (blocks * budget), 1) << " % of one core, p99 "
                   << juce::String (100.0 * sorted[(size_t) (0.99 * (double) sorted.size())] / budget, 0) << " %, worst " << juce::String (100.0 * sorted.back() / budget, 0)
                   << " % of the block, blocks over 50 %: " << over << "\n";
     }
@@ -1884,7 +1931,7 @@ int main()
 {
     juce::ScopedJuceInitialiser_GUI gui;
     if (std::getenv ("RS_FX_BENCH_ONLY") != nullptr) { benchmarkFx(); return 0; }
-    if (std::getenv ("RS_SCENE_BENCH_ONLY") != nullptr) { benchmarkScene (0, true, 3); benchmarkScene (0, true, 12); benchmarkScene (1, true, 12); return 0; }
+    if (std::getenv ("RS_SCENE_BENCH_ONLY") != nullptr) { benchmarkScene (0, true, 3); benchmarkScene (0, true, 12); benchmarkScene (1, true, 12); benchmarkScene (1, true, 12, true); return 0; }
 
     const auto a = tmp ("tone440_4s.wav"), b = tmp ("tone1000_8s.wav");
     writeTone (a, f1, 4.0, 0.5f);
@@ -1905,6 +1952,7 @@ int main()
     testTrim (a, b);
     testState (a, b);
     testFxRack (a, b);
+    testFxPresets();
     testModSources();
     testModMatrix (a, b);
     testDelayModes (a);
