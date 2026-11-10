@@ -2,6 +2,7 @@
 #include "SamplerEngine.h"
 
 #include <cmath>
+#include <cstring>
 
 #if defined (__clang__)
  #pragma clang diagnostic push
@@ -144,6 +145,142 @@ LayerPlayer::LayerPlayer()
 
 LayerPlayer::~LayerPlayer() = default;
 
+//==============================================================================
+struct StretchStartCache::Impl
+{
+    using Engine = signalsmith::stretch::SignalsmithStretch<float>;
+    enum State : int { empty = 0, building, ready, reading };
+
+    struct Entry
+    {
+        std::atomic<int> state { empty };
+        Key key;
+        int note = -1, channels = 0;
+        double rate = 0.0;
+        Engine engine { 0x5eedL };
+    };
+
+    static bool same (const Key& a, const Key& b) noexcept   { return std::memcmp (&a, &b, sizeof (Key)) == 0; }
+
+    std::array<Entry, capacity> entries;
+
+    Impl() { for (auto& e : entries) std::memset (&e.key, 0, sizeof (Key)); }
+
+    bool restore (const Key& key, Engine& into) noexcept
+    {
+        for (auto& e : entries)
+        {
+            if (e.state.load (std::memory_order_acquire) != ready || ! same (e.key, key))
+                continue;
+
+            int expected = ready;
+
+            if (! e.state.compare_exchange_strong (expected, reading, std::memory_order_acq_rel))
+                continue;
+
+            const bool hit = same (e.key, key);   // the worker may have replaced it between the check and the claim
+
+            if (hit)
+                into.copyStateFrom (e.engine);
+
+            e.state.store (ready, std::memory_order_release);
+
+            if (hit)
+                return true;
+        }
+
+        return false;
+    }
+
+    bool has (const Key& key) const noexcept
+    {
+        for (const auto& e : entries)
+            if (e.state.load (std::memory_order_acquire) == ready && same (e.key, key))
+                return true;
+
+        return false;
+    }
+
+    bool store (const Key& key, int note, int centre, const Engine& from, int channels, double rate)
+    {
+        Entry* target = nullptr;
+        int farthest = -1;
+        constexpr int unused = 1 << 20;
+
+        for (auto& e : entries)
+        {
+            const auto state = e.state.load (std::memory_order_acquire);
+
+            if (state == reading || state == building)
+                continue;
+
+            const int distance = state == empty ? unused : std::abs (e.note - centre);
+
+            if (distance > farthest) { farthest = distance; target = &e; }
+        }
+
+        // Only a free entry or one further from the centre than this note gives way.
+        if (target == nullptr || (farthest < unused && farthest <= std::abs (note - centre)))
+            return false;
+
+        int expected = target->state.load (std::memory_order_acquire);
+
+        if (expected == reading || expected == building
+            || ! target->state.compare_exchange_strong (expected, building, std::memory_order_acq_rel))
+            return false;
+
+        if (target->channels != channels || ! juce::exactlyEqual (target->rate, rate))
+        {
+            target->engine.presetDefault (channels, (float) rate, true);
+            target->channels = channels;
+            target->rate = rate;
+        }
+
+        target->engine.copyStateFrom (from);
+        target->key = key;
+        target->note = note;
+        target->state.store (ready, std::memory_order_release);
+        return true;
+    }
+};
+
+StretchStartCache::StretchStartCache() : impl (std::make_unique<Impl>()) {}
+StretchStartCache::~StretchStartCache() = default;
+
+bool StretchStartCache::store (const LayerPlayer& warmed, int note, int centre)
+{
+    if (! warmed.lastStartWasWarmable() || impl->has (warmed.startKey))
+        return false;
+
+    const auto& engine = warmed.stretcher->get (warmed.stretchMono);
+    return impl->store (warmed.startKey, note, centre, engine, warmed.stretchMono ? 1 : 2, warmed.hostRate);
+}
+
+void StretchStartCache::clear() noexcept
+{
+    for (auto& e : impl->entries)
+    {
+        int expected = Impl::ready;
+
+        if (e.state.compare_exchange_strong (expected, Impl::building, std::memory_order_acq_rel))
+        {
+            std::memset (&e.key, 0, sizeof (Key));
+            e.note = -1;
+            e.state.store (Impl::empty, std::memory_order_release);
+        }
+    }
+}
+
+int StretchStartCache::countReady() const noexcept
+{
+    int n = 0;
+
+    for (const auto& e : impl->entries)
+        n += e.state.load (std::memory_order_acquire) == Impl::ready ? 1 : 0;
+
+    return n;
+}
+
 namespace
 {
     /** Weighted sum with four running totals: no long chain of dependent additions. */
@@ -214,6 +351,7 @@ void LayerPlayer::start (const SampleData& sample, const LayerTiming& newTiming,
                          const Envelope& layerEnvelope, PeakHold hold, juce::int64 skipSamples) noexcept
 {
     active = false;
+    lastStartSeeked = false;
     holding = false;
     sampleLength = sample.audio.getNumSamples();
 
@@ -291,15 +429,33 @@ void LayerPlayer::start (const SampleData& sample, const LayerTiming& newTiming,
         const auto inputStart = (juce::int64) std::floor ((double) skip * timing.inputPerOutput);
         const auto seekLength = engine.outputSeekLength ((float) timing.inputPerOutput);
 
-        if (seekLength <= (int) seekInput[0].size())
+        std::memset (&startKey, 0, sizeof (startKey));   // compared bytewise: the padding must match too
+        startKey.hostRate = hostRate; startKey.readIncrement = timing.readIncrement;
+        startKey.inputPerOutput = timing.inputPerOutput; startKey.transpose = timing.transpose;
+        startKey.inputStart = inputStart;
+        startKey.channels[0] = channels[0]; startKey.channels[1] = channels[1];
+        startKey.regionStart = timing.regionStart; startKey.regionEnd = timing.regionEnd;
+        startKey.sampleLength = sampleLength; startKey.seekLength = seekLength;
+        startKey.reversed = reversed; startKey.mono = stretchMono; startKey.holdAtPeak = holdAtPeak;
+
+        if (startCache != nullptr && startCache->impl->restore (startKey, engine))
         {
-            fillInput (seekInput, inputStart, seekLength);
-            const float* inputs[2] = { seekInput[0].data(), seekInput[1].data() };
-            engine.outputSeek (inputs, seekLength);
+            lastStartSeeked = false;
         }
         else
         {
-            engine.outputSeek (ReaderInput { this, inputStart }, seekLength);
+            if (seekLength <= (int) seekInput[0].size())
+            {
+                fillInput (seekInput, inputStart, seekLength);
+                const float* inputs[2] = { seekInput[0].data(), seekInput[1].data() };
+                engine.outputSeek (inputs, seekLength);
+            }
+            else
+            {
+                engine.outputSeek (ReaderInput { this, inputStart }, seekLength);
+            }
+
+            lastStartSeeked = true;
         }
 
         inputFed = inputStart + seekLength;

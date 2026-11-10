@@ -1431,6 +1431,44 @@ static void testUiModulation (const juce::File& a, const juce::File& b)
     }
 }
 
+// Stretch warm starts: a chord started from the cache sounds exactly like one that pre-rolled itself,
+// and the block that starts the chord gets far cheaper.
+static void testWarmStarts()
+{
+    std::cout << "warm starts\n";
+    const auto a = tmp ("warm_a.wav"), b = tmp ("warm_b.wav");   // stereo: the stretcher does twice the work of the mono tests
+    writeTone (a, 330.0, 4.0, 0.4f, rate, 2); writeTone (b, 196.0, 3.0, 0.4f, rate, 2);
+    std::vector<std::pair<int, juce::MidiMessage>> events;
+    for (int k = 0; k < 6; ++k) events.push_back ({ 0, juce::MidiMessage::noteOn (1, 60 + k * 2, 0.8f) });
+    const auto makeOne = [&] {
+        Scene s; s.timeMode = 0; s.afterPeak = 1;
+        auto p = makeProcessor (s, a, b);
+        setParam (*p, L (0, ParamIDs::reverse), 1.0f);
+        setParam (*p, ParamIDs::attack, 5.0f);
+        return p;
+    };
+    double coldMs = 0.0, warmMs = 0.0;
+    auto cold = makeOne();
+    double startedAt = 0.0;
+    const auto withoutCache = renderEvents (*cold, 1.0, events, [&] (juce::int64 pos) { if (pos == 0) startedAt = juce::Time::getMillisecondCounterHiRes(); else if (pos == blockSize && coldMs == 0.0) coldMs = juce::Time::getMillisecondCounterHiRes() - startedAt; });
+    auto warm = makeOne();
+    const int warmed = warm->warmStretchStarts (60);
+    const auto withCache = renderEvents (*warm, 1.0, events, [&] (juce::int64 pos) { if (pos == 0) startedAt = juce::Time::getMillisecondCounterHiRes(); else if (pos == blockSize && warmMs == 0.0) warmMs = juce::Time::getMillisecondCounterHiRes() - startedAt; });
+    CHECK (warmed >= 12 && warm->countWarmStarts (0) >= 6 && warm->countWarmStarts (1) >= 6, "the warm-up pass fills both layers' caches around the centre note");
+    CHECK (withoutCache == withCache, "a chord started from the cache is bit-exact with a chord that pre-rolled itself");
+    double steadyMs = 0.0;
+    { auto p = makeOne(); p->warmStretchStarts (60); renderEvents (*p, 1.0, events, [&] (juce::int64 pos) { if (pos == 4 * blockSize) startedAt = juce::Time::getMillisecondCounterHiRes(); else if (pos == 5 * blockSize) steadyMs = juce::Time::getMillisecondCounterHiRes() - startedAt; }); }
+    std::cout << "    6-note chord, first block: " << coldMs << " ms cold, " << warmMs << " ms warm, a later block " << steadyMs << " ms (budget " << 1000.0 * blockSize / rate << " ms)\n";
+    CHECK (warmMs < 0.6 * coldMs, "a warm chord start costs much less than a cold one");
+    // A change that moves the notes is a miss, not a wrong hit: the slow path takes over and the sound stays right.
+    auto moved = makeOne();
+    moved->warmStretchStarts (60);
+    setParam (*moved, L (0, ParamIDs::pitch), 3.0f);
+    auto reference = makeOne();
+    setParam (*reference, L (0, ParamIDs::pitch), 3.0f);
+    CHECK (renderEvents (*moved, 0.5, events) == renderEvents (*reference, 0.5, events), "after a layer change the stale cache is never used");
+}
+
 static void testFxPresets()
 {
     ReverseSamplerProcessor p;
@@ -1953,6 +1991,7 @@ int main()
     testState (a, b);
     testFxRack (a, b);
     testFxPresets();
+    testWarmStarts();
     testModSources();
     testModMatrix (a, b);
     testDelayModes (a);

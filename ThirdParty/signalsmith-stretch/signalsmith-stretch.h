@@ -46,6 +46,40 @@ struct SignalsmithStretch {
 		return int(stft.synthesisLatency() + _splitComputation*stft.defaultInterval());
 	}
 	
+	// Reverse Sampler addition: copies the processing state from an identically configured stretcher
+	// (same channels, block and interval), so a seeked/pre-rolled engine can be reused without redoing
+	// the spectral work. Scratch buffers and the configuration (FFT plans, windows) are not copied.
+	// Allocation-free when the sizes match (std::vector::assign reuses the capacity).
+	void copyStateFrom(const SignalsmithStretch &other) {
+		blockProcess = other.blockProcess;
+		silenceCounter = other.silenceCounter;
+		silenceFirst = other.silenceFirst;
+		freqMultiplier = other.freqMultiplier;
+		freqTonalityLimit = other.freqTonalityLimit;
+		formantCompensation = other.formantCompensation;
+		formantMultiplier = other.formantMultiplier;
+		invFormantMultiplier = other.invFormantMultiplier;
+		formantBaseFreq = other.formantBaseFreq;
+		stft.copyStateFrom(other.stft);
+		stashedInput = other.stashedInput;
+		stashedOutput = other.stashedOutput;
+		prevInputOffset = other.prevInputOffset;
+		didSeek = other.didSeek;
+		seekTimeFactor = other.seekTimeFactor;
+		_channelBands.assign(other._channelBands.begin(), other._channelBands.end());
+		peaks.assign(other.peaks.begin(), other.peaks.end());
+		energy.assign(other.energy.begin(), other.energy.end());
+		smoothedEnergy.assign(other.smoothedEnergy.begin(), other.smoothedEnergy.end());
+		outputMap.assign(other.outputMap.begin(), other.outputMap.end());
+		channelPredictions.assign(other.channelPredictions.begin(), other.channelPredictions.end());
+		randomEngine = other.randomEngine;
+		processSpectrumSteps = other.processSpectrumSteps;
+		smoothEnergyState = other.smoothEnergyState;
+		freqEstimateWeighted = other.freqEstimateWeighted;
+		freqEstimateWeight = other.freqEstimateWeight;
+		freqEstimate = other.freqEstimate;
+	}
+
 	void reset() {
 		stft.reset(0.1);
 		stashedInput = stft.input;

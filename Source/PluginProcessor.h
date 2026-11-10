@@ -158,6 +158,11 @@ public:
     void updateLatency();
     int getArriveLatency() const noexcept                      { return arriveLatency.load(); }
 
+    /** Stretch warm starts (see rs::StretchStartCache). warmStretchStarts runs one pass on the calling
+        thread for the notes around `centreNote`: the worker thread does this in the background; tests
+        call it directly. Returns how many starts were warmed in this pass. */
+    int warmStretchStarts (int centreNote);
+    int countWarmStarts (int layer) const noexcept             { return startCaches[(size_t) layer].countReady(); }
     /** The last note played (MIDI or on-screen keyboard), or -1. */
     int getLastNote() const noexcept                           { return lastNote.load(); }
     double getTimelinePosition() const noexcept;
@@ -219,7 +224,11 @@ private:
         bool isEmpty() const noexcept   { return parameters.empty() && envelopes.empty() && samples.empty(); }
     };
 
-    void parameterValueChanged (int, float) override {}
+    void parameterValueChanged (int index, float) override
+    {
+        if (juce::isPositiveAndBelow (index, (int) parameterMovesNotes.size()) && parameterMovesNotes[(size_t) index] != 0)
+            invalidateWarmStarts();
+    }
     void parameterGestureChanged (int parameterIndex, bool gestureIsStarting) override;
     void noteSampleEdit (int layer);   // call before a user edit changes the sample of a layer
     void noteEdit();
@@ -273,6 +282,22 @@ private:
     std::array<rs::SharedEnvelope, numEnvelopes> envelopes;   // layer 1, layer 2, final, Release fade
     std::atomic<int> arriveLatency { 0 };
     std::atomic<int> lastNote { -1 };
+
+    // Warm starts: the worker re-warms after any change that can move a note (parameters, samples,
+    // tempo, Arrive latency). The audio thread only bumps a counter; the worker polls it.
+    struct StretchWarmer final : juce::Thread
+    {
+        explicit StretchWarmer (ReverseSamplerProcessor& p) : juce::Thread ("Reverse Sampler stretch warm-up"), owner (p) {}
+        void run() override;
+        ReverseSamplerProcessor& owner;
+    };
+    std::array<rs::StretchStartCache, numLayers> startCaches;
+    std::array<rs::LayerPlayer, numLayers> warmPlayers;      // the worker's own players: they pre-roll, the caches keep the result
+    StretchWarmer warmer { *this };
+    std::atomic<unsigned> warmGeneration { 1 };
+    std::mutex warmMutex;
+    std::vector<char> parameterMovesNotes;                   // per parameter index: a change re-warms
+    void invalidateWarmStarts() noexcept                        { warmGeneration.fetch_add (1, std::memory_order_release); }
     std::atomic<float>* playModeParam = nullptr;
     std::atomic<float>* afterPeakParam = nullptr;
     std::atomic<float>* dissolveParam = nullptr;

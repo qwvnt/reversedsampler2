@@ -217,6 +217,54 @@ int computeArriveLatency (const std::array<const SampleData*, numLayers>&, const
                           double hostRate, double bpm, double peakCutSeconds = 0.0) noexcept;
 
 //==============================================================================
+/** Warm note starts for one layer in Stretch mode.
+
+    Starting a stretched layer pre-rolls the time-stretcher (about 2 ms of FFT work per stereo layer):
+    a chord of five notes on two layers is 20 ms inside one audio block, far over the budget of any
+    small buffer. The pre-roll depends only on the layer's settings, the sample and the note, so a
+    background thread computes it ahead of time for the notes around the one last played, and a note
+    start copies the finished state in (a few hundred kilobytes, tens of microseconds). A note whose
+    key is not here starts the slow way, exactly as before; the output is identical either way.
+
+    Entries are claimed with a state machine, so the audio thread never waits for the worker and the
+    worker never rewrites an entry while it is being read.
+*/
+class LayerPlayer;
+
+class StretchStartCache
+{
+public:
+    static constexpr int capacity = 24;   // the last note +/- an octave; about 1 MB per stereo entry, allocated only in Stretch mode
+
+    /** Everything the pre-roll reads. Compared bytewise, so build it the same way on both threads. */
+    struct Key
+    {
+        double hostRate = 0.0, readIncrement = 0.0, inputPerOutput = 0.0, transpose = 0.0;
+        juce::int64 inputStart = 0;
+        const float* channels[2] {};
+        int regionStart = 0, regionEnd = 0, sampleLength = 0, seekLength = 0;
+        bool reversed = false, mono = false, holdAtPeak = false;
+    };
+
+    StretchStartCache();
+    ~StretchStartCache();
+
+    /** Worker: warms `note` of this layer from the player's last start (see LayerPlayer::warmedStart).
+        May allocate. Returns false when the start was not stretched, already cached, or every
+        candidate entry was busy; `centre` is the note the cache is kept around. */
+    bool store (const LayerPlayer& warmed, int note, int centre);
+    /** Worker (or any thread while the audio thread cannot run): forgets everything. */
+    void clear() noexcept;
+    int countReady() const noexcept;
+
+private:
+    friend class LayerPlayer;
+
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+};
+
+//==============================================================================
 /** Plays one layer of one note. The region is read forwards or backwards and
     resampled to the host rate. In Stretch mode, a time-stretcher then changes the
     pitch and the length independently; it is skipped when neither changes, so the
@@ -266,7 +314,15 @@ public:
 
     static constexpr int stretchChunk = 128;
 
+    /** Warm starts: with a cache, a stretched start whose key is warm copies the state in instead of
+        pre-rolling. Null (the default) always pre-rolls. */
+    void setStartCache (StretchStartCache* cache) noexcept   { startCache = cache; }
+    /** Whether the last start() pre-rolled the stretcher itself (so its state can be stored), and its key. */
+    bool lastStartWasWarmable() const noexcept               { return lastStartSeeked; }
+    const StretchStartCache::Key& lastStartKey() const noexcept { return startKey; }
+
 private:
+    friend class StretchStartCache;
     struct Stretcher;
 
     struct Grain
@@ -295,6 +351,9 @@ private:
     void fillInput (std::array<std::vector<float>, 2>& into, juce::int64 readerStart, int numFrames) noexcept;
 
     std::unique_ptr<Stretcher> stretcher;
+    StretchStartCache* startCache = nullptr;
+    StretchStartCache::Key startKey;
+    bool lastStartSeeked = false;
     std::array<std::vector<float>, 2> stretchInput, stretchOutput, seekInput;
     bool stretchMono = false;                 // a mono sample goes through a one-channel stretcher (half the work)
 
@@ -387,6 +446,8 @@ public:
     void pitchWheelMoved (int) override {}
     void controllerMoved (int, int) override {}
     void setCurrentPlaybackSampleRate (double newRate) override;
+    /** Warm starts for the layers (see StretchStartCache). Call before playback starts. */
+    void setStartCaches (const std::array<StretchStartCache*, numLayers>& caches) noexcept   { for (int l = 0; l < numLayers; ++l) players[(size_t) l].setStartCache (caches[(size_t) l]); }
 
     void renderNextBlock (juce::AudioBuffer<float>&, int startSample, int numSamples) override;
     using juce::SynthesiserVoice::renderNextBlock;

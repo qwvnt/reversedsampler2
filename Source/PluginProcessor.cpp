@@ -205,10 +205,19 @@ ReverseSamplerProcessor::ReverseSamplerProcessor()
         layerBuses[(size_t) layer].setParameters (bus);
     }
 
+    std::array<rs::StretchStartCache*, numLayers> caches {};
+    for (int layer = 0; layer < numLayers; ++layer)
+        caches[(size_t) layer] = &startCaches[(size_t) layer];
+
     for (int i = 0; i < numVoices; ++i)
-        synth.addSamplerVoice (new rs::SamplerVoice (globals, layerParams, bpm));
+    {
+        auto* voice = new rs::SamplerVoice (globals, layerParams, bpm);
+        voice->setStartCaches (caches);
+        synth.addSamplerVoice (voice);
+    }
 
     auditionVoice = new rs::SamplerVoice (globals, layerParams, bpm);
+    auditionVoice->setStartCaches (caches);
     auditionSynth.addSamplerVoice (auditionVoice);
 
     installSamples ({});
@@ -219,6 +228,16 @@ ReverseSamplerProcessor::ReverseSamplerProcessor()
     parameterTouched.assign ((size_t) allParameters.size(), 0);
     parameterGestures.assign ((size_t) allParameters.size(), 0);
 
+    parameterMovesNotes.assign ((size_t) allParameters.size(), 0);
+
+    for (int i = 0; i < allParameters.size(); ++i)
+    {
+        const auto id = dynamic_cast<juce::AudioProcessorParameterWithID*> (allParameters[i]) != nullptr
+                      ? dynamic_cast<juce::AudioProcessorParameterWithID*> (allParameters[i])->paramID : juce::String();
+        // FX and modulation never move a note; everything else (layers, play mode, peak cut...) can.
+        parameterMovesNotes[(size_t) i] = id.startsWith ("fx") || id.startsWith ("mod") || id.startsWith ("lfo") || id.startsWith ("macro") ? 0 : 1;
+    }
+
     for (auto* param : allParameters)
         param->addListener (this);
 
@@ -228,6 +247,7 @@ ReverseSamplerProcessor::ReverseSamplerProcessor()
 ReverseSamplerProcessor::~ReverseSamplerProcessor()
 {
     stopTimer();
+    warmer.stopThread (5000);
 
     // Cancels the background loads (they stop between two chunks) and waits for the worker.
     for (auto& serial : loadSerials)
@@ -493,6 +513,13 @@ const juce::String ReverseSamplerProcessor::getName() const
 
 void ReverseSamplerProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
+    // The worker's players are prepared here, so it must be idle; it starts again below.
+    warmer.stopThread (5000);
+    for (auto& cache : startCaches)
+        cache.clear();
+    for (auto& player : warmPlayers)
+        player.prepare (sampleRate);
+
     synth.setCurrentPlaybackSampleRate (sampleRate);
     auditionSynth.setCurrentPlaybackSampleRate (sampleRate);
     auditionHeld = false;
@@ -512,6 +539,112 @@ void ReverseSamplerProcessor::prepareToPlay (double sampleRate, int samplesPerBl
     lastGainDb = gainParam->load();
     lastGain = lastGainTarget = juce::Decibels::decibelsToGain (lastGainDb);
     updateLatency();
+    invalidateWarmStarts();
+    warmer.startThread (juce::Thread::Priority::normal);
+}
+
+//==============================================================================
+// Warm starts. One pass warms the stretched layers of the notes nearest to centreNote, nearest
+// first, as many as the caches hold. A note's layout is computed exactly as SamplerVoice::startNote
+// does it, so the worker's players start with the same key the voices build, and the stored state
+// is what the voice would have computed itself.
+int ReverseSamplerProcessor::warmStretchStarts (int centreNote)
+{
+    const std::lock_guard<std::mutex> guard (warmMutex);   // the worker and a direct call never share the players
+    std::array<rs::SampleDataPtr, numLayers> held;
+    std::array<const rs::SampleData*, numLayers> pointers {};
+    std::array<rs::LayerSettings, numLayers> settings;
+    bool anyStretch = false;
+
+    for (int layer = 0; layer < numLayers; ++layer)
+    {
+        held[(size_t) layer] = getSample (layer);
+        pointers[(size_t) layer] = held[(size_t) layer].get();
+        settings[(size_t) layer] = getLayerSettings (layer);
+        anyStretch = anyStretch || (pointers[(size_t) layer] != nullptr && settings[(size_t) layer].enabled && settings[(size_t) layer].timeMode == rs::TimeMode::stretch);
+    }
+
+    if (! anyStretch)
+        return 0;
+
+    const auto hostRate = getPlaybackRate();
+    const auto tempo = bpm.load();
+    const auto mode = getPlayMode();
+    const auto latency = mode == rs::PlayMode::arrive ? (double) arriveLatency.load() : 0.0;
+    const auto cutSeconds = getPeakCutSeconds();
+    const auto afterPeak = getAfterPeak();
+    const int centre = juce::jlimit (0, 127, centreNote < 0 ? 60 : centreNote);
+    int warmed = 0;
+
+    for (int step = 0; step < 2 * rs::StretchStartCache::capacity; ++step)
+    {
+        // 0, +1, -1, +2, -2 ...: nearest first
+        const int note = centre + ((step + 1) / 2) * ((step % 2) != 0 ? 1 : -1);
+
+        if (! juce::isPositiveAndBelow (note, 128) || warmer.threadShouldExit())
+            continue;
+
+        const auto layout = rs::computeNoteLayout (pointers, settings, note, mode, latency, hostRate, tempo, cutSeconds);
+
+        if (! layout.anyLayer)
+            continue;
+
+        for (int layer = 0; layer < numLayers; ++layer)
+        {
+            const auto& l = layout.layers[(size_t) layer];
+
+            if (pointers[(size_t) layer] == nullptr || ! l.active || ! l.timing.useStretcher)
+                continue;
+
+            auto& player = warmPlayers[(size_t) layer];
+            const auto skip = l.start < 0.0 ? (juce::int64) std::llround (-l.start) : (juce::int64) 0;
+            player.start (*pointers[(size_t) layer], l.timing, settings[(size_t) layer].reversed, rs::Envelope {},
+                          rs::LayerPlayer::PeakHold { afterPeak, l.length, l.reachesPeak }, skip);
+            player.stop();
+
+            if (startCaches[(size_t) layer].store (player, note, centre))
+                ++warmed;
+        }
+    }
+
+    return warmed;
+}
+
+void ReverseSamplerProcessor::StretchWarmer::run()
+{
+    unsigned done = 0;
+    int centre = -1;
+
+    while (! threadShouldExit())
+    {
+        const auto wanted = owner.warmGeneration.load (std::memory_order_acquire);
+        const int played = owner.lastNote.load (std::memory_order_relaxed);
+        const bool moved = played >= 0 && (centre < 0 || std::abs (played - centre) > 12);   // the player went elsewhere: follow
+
+        if (wanted == done && ! moved)
+        {
+            wait (50);
+            continue;
+        }
+
+        if (wanted != done)
+        {
+            wait (60);   // a knob being turned settles first
+
+            if (threadShouldExit())
+                break;
+        }
+
+        const auto generation = owner.warmGeneration.load (std::memory_order_acquire);
+
+        if (generation != done)
+            for (auto& cache : owner.startCaches)
+                cache.clear();
+
+        centre = owner.lastNote.load (std::memory_order_relaxed);
+        owner.warmStretchStarts (centre);
+        done = generation;
+    }
 }
 
 bool ReverseSamplerProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -529,7 +662,11 @@ void ReverseSamplerProcessor::updateBpm()
         {
             if (const auto hostBpm = position->getBpm())
                 if (*hostBpm > 1.0)
+                {
+                    if (! juce::exactlyEqual (bpm.load(), *hostBpm))
+                        invalidateWarmStarts();
                     bpm.store (*hostBpm);
+                }
 
             if (const auto ppq = position->getPpqPosition())
             {
@@ -1397,6 +1534,7 @@ void ReverseSamplerProcessor::installSamples (const std::array<rs::SampleDataPtr
     }
 
     ++sampleVersion;
+    invalidateWarmStarts();
 }
 
 bool ReverseSamplerProcessor::canReadFile (const juce::File& file) const
@@ -1519,6 +1657,8 @@ void ReverseSamplerProcessor::updateLatency()
         latency = rs::computeArriveLatency (pointers, settings, getPlaybackRate(), bpm.load(), getPeakCutSeconds());
     }
 
+    if (arriveLatency.load() != latency)
+        invalidateWarmStarts();
     arriveLatency.store (latency);
 
     if (getLatencySamples() != latency)
