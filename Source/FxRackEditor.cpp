@@ -307,6 +307,9 @@ public:
         type.addItemList ({ "Empty", "Delay", "EQ", "Drive", "Reverb", "Chorus", "Compressor" }, 1); addAndMakeVisible (type);
         type.setTooltip ("Select an effect, or Empty to remove it");
         typeValue = state.getRawParameterValue (rs::fxID (n, "type"));
+        presets.setTooltip ("Factory presets for this slot's effect (or for any effect while the slot is Empty); one Undo step");
+        addAndMakeVisible (presets);
+        presets.onClick = [this] { showPresetMenu(); };
         syncType();
         type.onChange = [this] {
             shownTypeId = type.getSelectedId();
@@ -471,7 +474,7 @@ public:
     }
     void resized() override {
         auto area = getLocalBounds().reduced (9); handle.setBounds (area.removeFromTop (27)); area.removeFromTop (6);
-        type.setBounds (area.removeFromTop (28)); area.removeFromTop (5);
+        auto header = area.removeFromTop (28); presets.setBounds (header.removeFromRight (juce::jmin (84, header.getWidth() / 3))); header.removeFromRight (4); type.setBounds (header); area.removeFromTop (5);
         auto row = area.removeFromTop (26); routes[0].setBounds (row.removeFromLeft (row.getWidth()/2).reduced (2, 0)); routes[1].setBounds (row.reduced (2, 0));
         area.removeFromTop (4);
         if (type.getSelectedId() == 3) {
@@ -565,6 +568,35 @@ public:
     void itemDropped (const SourceDetails& d) override { highlight = false; repaint(); const int from = (int)d.description; if (juce::isPositiveAndBelow (from, rs::fxSlots) && from != index) processor.swapFxSlots (from, index); }
 private:
     void timerCallback() override { syncType(); updateLabels(); }
+    // Presets of the slot's effect, grouped by genre. An Empty slot lists every effect's presets.
+    void showPresetMenu() {
+        const int current = typeValue == nullptr ? 0 : juce::jlimit (0, rs::numFxTypes - 1, (int) std::round (typeValue->load()));
+        const auto genreMenu = [] (int fxType) {
+            juce::PopupMenu byGenre;
+            juce::StringArray genres;
+            for (const auto& preset : rs::fxPresets)
+                if (preset.type == fxType) genres.addIfNotAlreadyThere (preset.genre);
+            for (const auto& genre : genres) {
+                juce::PopupMenu group;
+                for (size_t k = 0; k < rs::numFxPresets; ++k)
+                    if (rs::fxPresets[k].type == fxType && genre == rs::fxPresets[k].genre) group.addItem ((int) k + 1, rs::fxPresets[k].name);
+                byGenre.addSubMenu (genre, group);
+            }
+            return byGenre;
+        };
+        juce::PopupMenu menu;
+        if (current == 0)
+            for (int t = 1; t < rs::numFxTypes; ++t) menu.addSubMenu (rs::fxTypeNames[t], genreMenu (t));
+        else menu = genreMenu (current);
+        juce::Component::SafePointer<Slot> safe (this);
+        menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&presets).withMinimumWidth (presets.getWidth()), [safe] (int result) {
+            if (safe == nullptr || result <= 0 || (size_t) result > rs::numFxPresets) return;
+            safe->processor.applyFxPreset (safe->index, rs::fxPresets[(size_t) result - 1]);
+            safe->shownTypeId = 1 + rs::fxPresets[(size_t) result - 1].type;
+            safe->type.setSelectedId (safe->shownTypeId, juce::dontSendNotification);
+            safe->updateLabels();
+        });
+    }
     void syncType() {
         const int id = 1 + (typeValue == nullptr ? 0 : juce::jlimit (0, rs::numFxTypes - 1, (int) std::round (typeValue->load())));
         if (type.isPopupActive() || type.getSelectedId() != shownTypeId) return;
@@ -897,6 +929,7 @@ private:
     }
     ReverseSamplerProcessor& processor; int index, lastType = -1, lastStyle = -1; bool lastSync = false, lastLimited = false, highlight = false;
     juce::ComboBox type, style, division; juce::Slider replica, splice; juce::Label spliceLabel; juce::TextButton sync, direction, brown; std::array<juce::TextButton,2> routes;
+    juce::TextButton presets { "PRESETS" };
     std::array<juce::Slider,4> knobs; std::array<juce::Slider,2> special; std::array<juce::Label,4> labels;
     std::unique_ptr<ComboAttachment> typeAttachment, styleAttachment, divisionAttachment;
     std::unique_ptr<SliderAttachment> replicaAttachment, spliceAttachment;

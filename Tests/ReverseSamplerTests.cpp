@@ -1431,6 +1431,46 @@ static void testUiModulation (const juce::File& a, const juce::File& b)
     }
 }
 
+static void testFxPresets()
+{
+    ReverseSamplerProcessor p;
+    auto& state = p.getValueTreeState();
+    const auto value = [&] (int slot, const char* name) { return state.getRawParameterValue (rs::fxID (slot, name))->load(); };
+    int perType[rs::numFxTypes] {};
+    bool allValid = true, allLand = true, keepRouting = true, restoreDefaults = true;
+    for (size_t k = 0; k < rs::numFxPresets; ++k)
+    {
+        const auto& preset = rs::fxPresets[k];
+        if (! juce::isPositiveAndBelow (preset.type, rs::numFxTypes) || preset.type == 0) { allValid = false; continue; }
+        ++perType[preset.type];
+        const int slot = (int) (k % rs::fxSlots);
+        setParam (p, rs::fxID (slot, "b"), 0.0f);
+        setParam (p, rs::fxID (slot, "diffusion"), 77.0f);   // not part of any preset: must return to its default
+        p.applyFxPreset (slot, preset);
+        if ((int) std::round (value (slot, "type")) != preset.type) allLand = false;
+        for (const auto& v : preset.values)
+        {
+            auto* param = state.getParameter (rs::fxID (slot, v.name));
+            if (param == nullptr) { allValid = false; continue; }
+            const float got = param->convertFrom0to1 (param->getValue());
+            if (std::abs (got - v.value) > 0.051f + 0.001f * std::abs (v.value)) { allLand = false; std::cout << "    preset " << preset.name << ": " << v.name << " = " << got << ", wanted " << v.value << "\n"; }
+        }
+        if (value (slot, "b") >= 0.5f) keepRouting = false;
+        bool diffusionInPreset = false;
+        for (const auto& v : preset.values) if (juce::String (v.name) == "diffusion") diffusionInPreset = true;
+        if (! diffusionInPreset && std::abs (value (slot, "diffusion")) > 1.0e-3f) restoreDefaults = false;
+        setParam (p, rs::fxID (slot, "b"), 1.0f);
+    }
+    bool enough = true;
+    for (int t = 1; t < rs::numFxTypes; ++t) if (perType[t] < 5) enough = false;
+    CHECK (allValid, "every FX preset names an effect type and existing parameters");
+    CHECK (enough, "at least 5 presets for every effect type");
+    CHECK (allLand, "every preset value lands on its parameter (within the parameter's step)");
+    CHECK (keepRouting, "a preset keeps the slot's A/B routing");
+    CHECK (restoreDefaults, "a preset restores the settings it does not mention to their defaults");
+    CHECK (p.canUndo(), "a preset is an undo step");
+}
+
 static void testFxRack (const juce::File& a, const juce::File& b)
 {
     std::cout << "FX rack\n";
@@ -1912,6 +1952,7 @@ int main()
     testTrim (a, b);
     testState (a, b);
     testFxRack (a, b);
+    testFxPresets();
     testModSources();
     testModMatrix (a, b);
     testDelayModes (a);

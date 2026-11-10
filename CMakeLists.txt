@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.22)
 # Minimum macOS version for the built plug-in (ignored on other platforms).
 set(CMAKE_OSX_DEPLOYMENT_TARGET "10.13" CACHE STRING "Minimum macOS version")
 
-project(ReverseSampler VERSION 0.20.0)
+project(ReverseSampler VERSION 0.21.0)
 
 # -----------------------------------------------------------------------------
 # JUCE
@@ -68,6 +68,7 @@ set(RS_SOURCES
     Source/ModMatrixEditor.cpp
     Source/CompressorDsp.h
     Source/FxRack.h
+    Source/FxPresets.h
     Source/FxRack.cpp
     Source/FxRackEditor.h
     Source/FxRackEditor.cpp
