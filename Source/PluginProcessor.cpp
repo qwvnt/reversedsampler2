@@ -787,7 +787,7 @@ void ReverseSamplerProcessor::applyFxPreset (int slot, const rs::FxPreset& prese
     const char* shared[] { "p1", "p2", "p3", "mix" };
     for (int k = 0; k < 4; ++k)
         set (shared[k], rs::fxTypeDefaults[preset.type][k]);
-    for (const auto& value : preset.values)
+    for (const auto& value : preset)
         set (value.name, value.value);
     fxRack.requestReset (slot);
     if (typeChanges)

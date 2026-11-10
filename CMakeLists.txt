@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.22)
 # Minimum macOS version for the built plug-in (ignored on other platforms).
 set(CMAKE_OSX_DEPLOYMENT_TARGET "10.13" CACHE STRING "Minimum macOS version")
 
-project(ReverseSampler VERSION 0.21.0)
+project(ReverseSampler VERSION 0.21.1)
 
 # -----------------------------------------------------------------------------
 # JUCE

@@ -850,11 +850,11 @@ static void testDeclick (const juce::File& a, const juce::File& b)
         return p;
     };
 
-    // Voice stealing: 16 identical voices (note 60 on 16 channels), then a 17th note.
+    // Voice stealing: every voice busy (note 60 on numVoices channels), then one note more.
     {
         std::vector<std::pair<int, juce::MidiMessage>> events;
 
-        for (int ch = 1; ch <= 16; ++ch)
+        for (int ch = 1; ch <= ReverseSamplerProcessor::numVoices; ++ch)
             events.push_back ({ 0, juce::MidiMessage::noteOn (ch, 60, 1.0f) });
 
         auto p = makeOne();
@@ -862,7 +862,7 @@ static void testDeclick (const juce::File& a, const juce::File& b)
 
         int at = (int) rate;   // the steal falls where one voice is near its peak
 
-        while (std::abs (without[(size_t) at]) / 16.0 < 0.45)
+        while (std::abs (without[(size_t) at]) / (double) ReverseSamplerProcessor::numVoices < 0.45)
             ++at;
 
         events.push_back ({ at, juce::MidiMessage::noteOn (1, 72, 1.0f) });
@@ -875,7 +875,7 @@ static void testDeclick (const juce::File& a, const juce::File& b)
             diff[i] = with[i] - without[i];
 
         const auto rough = roughnessAt (diff, at, 64, 480);
-        std::cout << "    steal: voice value " << without[(size_t) at] / 16.0 << ", roughness " << rough << "\n";
+        std::cout << "    steal: voice value " << without[(size_t) at] / (double) ReverseSamplerProcessor::numVoices << ", roughness " << rough << "\n";
         CHECK (rough < 0.03, "a stolen voice fades out instead of clicking");
         CHECK (std::abs (diff[(size_t) at + 1200]) < 2.0, "after the steal the rest plays on");
     }
@@ -1448,7 +1448,7 @@ static void testFxPresets()
         setParam (p, rs::fxID (slot, "diffusion"), 77.0f);   // not part of any preset: must return to its default
         p.applyFxPreset (slot, preset);
         if ((int) std::round (value (slot, "type")) != preset.type) allLand = false;
-        for (const auto& v : preset.values)
+        for (const auto& v : preset)
         {
             auto* param = state.getParameter (rs::fxID (slot, v.name));
             if (param == nullptr) { allValid = false; continue; }
@@ -1457,7 +1457,7 @@ static void testFxPresets()
         }
         if (value (slot, "b") >= 0.5f) keepRouting = false;
         bool diffusionInPreset = false;
-        for (const auto& v : preset.values) if (juce::String (v.name) == "diffusion") diffusionInPreset = true;
+        for (const auto& v : preset) if (juce::String (v.name) == "diffusion") diffusionInPreset = true;
         if (! diffusionInPreset && std::abs (value (slot, "diffusion")) > 1.0e-3f) restoreDefaults = false;
         setParam (p, rs::fxID (slot, "b"), 1.0f);
     }
