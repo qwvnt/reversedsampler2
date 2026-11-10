@@ -292,10 +292,10 @@ private:
     void respawnGrain (Grain&) noexcept;
     void renderHold (float* left, float* right, const float* gains, int numSamples) noexcept;
 
-    void fillStretchInput (juce::int64 readerStart, int numFrames) noexcept;
+    void fillInput (std::array<std::vector<float>, 2>& into, juce::int64 readerStart, int numFrames) noexcept;
 
     std::unique_ptr<Stretcher> stretcher;
-    std::array<std::vector<float>, 2> stretchInput, stretchOutput;
+    std::array<std::vector<float>, 2> stretchInput, stretchOutput, seekInput;
     bool stretchMono = false;                 // a mono sample goes through a one-channel stretcher (half the work)
 
     const float* channels[2] {};

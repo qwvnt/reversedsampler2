@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 
 namespace rs::comp {
 
@@ -143,9 +144,11 @@ private:
         float detector = 0.0f, reductionDb = 0.0f;
         float gainForDb = 0.0f, gain = 1.0f;
         std::array<float, 3> stage {};
-        float charge = 0.0f;
+        float charge = 0.0f, optoFor = -1.0f, optoRelease = 0.0f;
         float highPass[2] {}, highPassPrevious[2] {};
         float tubePrevious[2] {}, dcIn[2] {}, dcOut[2] {}, low[2] {}, top[2] {};
+        double tubeAntiPrevious[2] {};   // the antiderivative at tubePrevious, so each sample evaluates it once
+        bool tubeAntiValid[2] {};
     };
     static Settings sanitize (Settings s) noexcept {
         const auto finite = [] (float v, float fallback) { return std::isfinite (v) ? v : fallback; };
@@ -198,7 +201,10 @@ private:
         s.charge += compressing ? chargeUp * (1.0f - s.charge) : -chargeDown * s.charge;
         s.charge = std::clamp (s.charge, 0.0f, 1.0f);
         float release[3] { d.stageRelease[0], d.stageRelease[1], d.stageRelease[2] };
-        if (d.opto) release[1] = coefficient (1.0 + 14.0 * (double) s.charge);
+        if (d.opto) {   // the exp only runs while the charge moves
+            if (std::memcmp (&s.optoFor, &s.charge, sizeof (float)) != 0) { s.optoFor = s.charge; s.optoRelease = coefficient (1.0 + 14.0 * (double) s.charge); }
+            release[1] = s.optoRelease;
+        }
         for (int i = 0; i < d.stages; ++i) {
             auto& g = s.stage[(size_t) i];
             g += (targetDb > g ? d.attack : release[i]) * (targetDb - g);
@@ -214,7 +220,10 @@ private:
         const double u1 = (double) (x * drive), u0 = (double) s.tubePrevious[c];
         s.tubePrevious[c] = (float) u1;
         const auto anti = [tb] (double u) { return detail::logCosh (u + detail::tubeBias) - tb * u; };
-        const double shaped = std::abs (u1 - u0) > 1.0e-5 ? (anti (u1) - anti (u0)) / (u1 - u0) : std::tanh (0.5 * (u0 + u1) + detail::tubeBias) - tb;
+        const double anti1 = anti (u1);
+        const double anti0 = s.tubeAntiValid[c] ? s.tubeAntiPrevious[c] : anti (u0);
+        s.tubeAntiPrevious[c] = anti1; s.tubeAntiValid[c] = true;
+        const double shaped = std::abs (u1 - u0) > 1.0e-5 ? (anti1 - anti0) / (u1 - u0) : std::tanh (0.5 * (u0 + u1) + detail::tubeBias) - tb;
         return (float) (shaped * norm) / drive;
     }
     void run (Layer& s, float* left, float* right, int n, float& inPeak, float& outPeak, float& reduction, float& level) noexcept {

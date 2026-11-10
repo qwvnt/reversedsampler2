@@ -4,6 +4,7 @@
 #include <cmath>
 #include <complex>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 namespace rs::chorus {
@@ -159,7 +160,7 @@ public:
     }
     void reset() noexcept {
         for (int l = 0; l < 2; ++l) resetLayer (l);
-        current = derive (target);
+        current = derive (target); preampTanh = std::tanh ((double) current.preampBias);
         remaining = 0;
     }
     void resetLayer (int layer) noexcept {
@@ -172,6 +173,7 @@ public:
         s.voiceTone = {};
         s.wetPrevious[0] = s.wetPrevious[1] = 0.0f;
         s.preampPrevious[0] = s.preampPrevious[1] = 0.0f;
+        s.preampAntiGain = -1.0;
         s.dc[0] = s.dc[1] = s.dcPrevious[0] = s.dcPrevious[1] = 0.0f;
         s.drift = 0.0f;
         s.random.seed (layer == 0 ? 0x1234567u : 0x7654321u);
@@ -184,7 +186,7 @@ public:
             for (int l = 0; l < 2; ++l) resetLayer (l);
             snap = true;
         } else topology = makeTopology (target);
-        if (snap) { current = derive (target); remaining = 0; }
+        if (snap) { current = derive (target); preampTanh = std::tanh ((double) current.preampBias); remaining = 0; }
     }
     void process (float* const* ch, const bool* enabled, int n) noexcept {
         int done = 0;
@@ -233,6 +235,8 @@ private:
         std::array<double, maxVoices> heads {};
         std::array<float, maxVoices> voiceTone {};
         float wetPrevious[2] {}, preampPrevious[2] {}, dc[2] {}, dcPrevious[2] {};
+        double preampAntiPrevious[2] {};   // the preamp antiderivative at preampPrevious, under preampAntiGain / preampAntiBias
+        double preampAntiGain = -1.0, preampAntiBias = 0.0;
         float drift = 0.0f;
         detail::Random random;
         int activeLines = 0;
@@ -381,6 +385,7 @@ private:
         glide (current.wetGain, goal.wetGain); glide (current.feedback, goal.feedback); glide (current.dryMix, goal.dryMix);
         glide (current.wetMix, goal.wetMix); glide (current.width, goal.width); glide (current.output, goal.output);
         glide (current.preampGain, goal.preampGain); glide (current.preampBias, goal.preampBias);
+        preampTanh = std::tanh ((double) current.preampBias);
         for (auto& layer : layers) {
             if (topology.drift) {
                 layer.drift = layer.drift * 0.998f + 0.0015f * layer.random.unitNoise();
@@ -399,11 +404,16 @@ private:
         line.compressorEnvelope = line.expanderEnvelope = 0.0f;
     }
     float preamp (Layer& layer, int channel, float x) const noexcept {
-        const double gain = current.preampGain, bias = current.preampBias, tb = std::tanh (bias);
+        const double gain = current.preampGain, bias = current.preampBias, tb = preampTanh;
         const double u1 = gain * (double) x, u0 = gain * (double) layer.preampPrevious[channel];
         layer.preampPrevious[channel] = x;
         const auto anti = [bias, tb] (double u) { return detail::logCosh (u + bias) - tb * u; };
-        const double shaped = std::abs (u1 - u0) > 1.0e-5 ? (anti (u1) - anti (u0)) / (u1 - u0) : std::tanh (0.5 * (u0 + u1) + bias) - tb;
+        // The previous sample's antiderivative is reused while the preamp settings stand still (per tick).
+        const bool cached = std::memcmp (&layer.preampAntiGain, &gain, sizeof (double)) == 0 && std::memcmp (&layer.preampAntiBias, &bias, sizeof (double)) == 0;
+        const double anti1 = anti (u1), anti0 = cached ? layer.preampAntiPrevious[channel] : anti (u0);
+        layer.preampAntiPrevious[channel] = anti1;
+        if (! cached && channel == 1) { layer.preampAntiGain = gain; layer.preampAntiBias = bias; }
+        const double shaped = std::abs (u1 - u0) > 1.0e-5 ? (anti1 - anti0) / (u1 - u0) : std::tanh (0.5 * (u0 + u1) + bias) - tb;
         return (float) (shaped / (gain * (1.0 - tb * tb)));
     }
     float runLine (Line& line, float input, double clockHz) noexcept {
@@ -546,6 +556,7 @@ private:
     }
 
     double fs = 48000.0;
+    double preampTanh = 0.0;   // tanh (current.preampBias), once per tick
     Settings target;
     Topology topology;
     Derived current;

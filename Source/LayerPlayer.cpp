@@ -195,6 +195,13 @@ void LayerPlayer::prepare (double hostSampleRate)
     for (auto& channel : stretchInput)
         channel.assign (maxInput, 0.0f);
 
+    // The note-on pre-roll reads its input region once, both channels from one kernel, instead of
+    // rebuilding a sinc kernel for every random access the stretcher makes.
+    const auto maxSeek = (size_t) stretcher->stereo.outputSeekLength ((float) maxSqueeze) + 16;
+
+    for (auto& channel : seekInput)
+        channel.assign (maxSeek, 0.0f);
+
     // Grains for Freeze: up to 120 ms, Hann window.
     const auto maxGrain = juce::jmax (64, juce::roundToInt (0.12 * hostSampleRate));
     grainWindow.resize ((size_t) maxGrain + 1);
@@ -283,8 +290,18 @@ void LayerPlayer::start (const SampleData& sample, const LayerTiming& newTiming,
         // Pre-rolls the stretcher so its first output lines up with the start (or the skip) of the region.
         const auto inputStart = (juce::int64) std::floor ((double) skip * timing.inputPerOutput);
         const auto seekLength = engine.outputSeekLength ((float) timing.inputPerOutput);
-        ReaderInput input { this, inputStart };
-        engine.outputSeek (input, seekLength);
+
+        if (seekLength <= (int) seekInput[0].size())
+        {
+            fillInput (seekInput, inputStart, seekLength);
+            const float* inputs[2] = { seekInput[0].data(), seekInput[1].data() };
+            engine.outputSeek (inputs, seekLength);
+        }
+        else
+        {
+            engine.outputSeek (ReaderInput { this, inputStart }, seekLength);
+        }
+
         inputFed = inputStart + seekLength;
     }
 
@@ -546,10 +563,10 @@ void LayerPlayer::readFrame (double readerIndex, double readerStep, float& left,
     right = channels[1] == channels[0] ? left : applyKernel (kernel, 1);
 }
 
-void LayerPlayer::fillStretchInput (juce::int64 readerStart, int numFrames) noexcept
+void LayerPlayer::fillInput (std::array<std::vector<float>, 2>& into, juce::int64 readerStart, int numFrames) noexcept
 {
-    auto* l = stretchInput[0].data();
-    auto* r = stretchInput[1].data();
+    auto* l = into[0].data();
+    auto* r = into[1].data();
 
     for (int i = 0; i < numFrames; ++i)
     {
@@ -630,7 +647,7 @@ void LayerPlayer::render (float* left, float* right, const float* gains, int num
 
             if (numInput <= (int) stretchInput[0].size())
             {
-                fillStretchInput (inputFed, numInput);
+                fillInput (stretchInput, inputFed, numInput);
                 const float* inputs[2] = { stretchInput[0].data(), stretchInput[1].data() };
                 engine.process (inputs, numInput, outputs, chunk);
             }
