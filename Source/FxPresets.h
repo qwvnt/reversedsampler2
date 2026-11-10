@@ -4,17 +4,33 @@
 // Anything a preset does not mention is left at the parameter's default, so every preset starts
 // from the same clean state no matter what the slot held before. The A/B routing is kept.
 #include <cstddef>
-#include <initializer_list>
 
 namespace rs {
 
-struct FxPresetValue { const char* name; float value; };
+struct FxPresetValue { const char* name = nullptr; float value = 0.0f; };
 
+constexpr int maxFxPresetValues = 12;
+
+// values is a fixed array ending at the first null name (never an initializer_list: in a constexpr
+// aggregate MSVC lets its backing array die, and reading the preset crashes).
 struct FxPreset {
     const char* genre;   // the sub-menu it sits in
     const char* name;
     int type;
-    std::initializer_list<FxPresetValue> values;
+    FxPresetValue values[maxFxPresetValues];
+
+    struct Iterator {
+        const FxPresetValue* v;
+        bool operator!= (const Iterator& o) const noexcept { return v != o.v; }
+        void operator++() noexcept { ++v; }
+        const FxPresetValue& operator*() const noexcept { return *v; }
+    };
+    Iterator begin() const noexcept { return { values }; }
+    Iterator end() const noexcept {
+        int n = 0;
+        while (n < maxFxPresetValues && values[n].name != nullptr) ++n;
+        return { values + n };
+    }
 };
 
 // Compressor knobs: Threshold -60..0 dB over 0..100 (70 = -18 dB), Ratio 1:1..20:1 exponential

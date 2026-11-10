@@ -60,7 +60,7 @@ public:
     static constexpr int mainEnvelope = rs::numLayers;          // envelope index of the final envelope (on the sum)
     static constexpr int dissolveEnvelope = rs::numLayers + 1;  // the fade after the peak (After peak = Release)
     static constexpr int numEnvelopes = rs::numLayers + 2;
-    static constexpr int numVoices = 16;
+    static constexpr int numVoices = 8;
     static constexpr double maxSampleLengthSeconds = 120.0;
     static constexpr int maxUndoSteps = 8;
     static constexpr int modulationStep = 32;

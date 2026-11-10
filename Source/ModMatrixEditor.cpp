@@ -598,7 +598,8 @@ public:
         const bool nowActive = settings.source != rs::mod::none && settings.destination > 0 && std::abs (settings.amount) >= 1.0e-6f;
         const float nowValue = processor.getModMatrix().rowValue (row);
         const bool nowUsed = settings.source != rs::mod::none || settings.destination > 0;
-        if (nowActive != active || nowUsed != used || ! exactlyEqual (nowValue, value)) {
+        if (fresh || nowActive != active || nowUsed != used || ! exactlyEqual (nowValue, value)) {
+            fresh = false;
             active = nowActive; used = nowUsed; value = nowValue;
             for (auto* c : std::initializer_list<Component*> { &aux, &amount, &curve, &bipolar }) c->setAlpha (used ? 1.0f : 0.45f);
             clear.setEnabled (used || std::abs (settings.amount) >= 1.0e-6f);
@@ -645,7 +646,7 @@ private:
     std::unique_ptr<APVTS::SliderAttachment> amountAttachment, curveAttachment;
     std::unique_ptr<APVTS::ButtonAttachment> bipolarAttachment;
     Rectangle<int> meter, number;
-    bool active = false, used = false;
+    bool active = false, used = true, fresh = true;   // fresh: the first refresh always applies the state (an unused row is dimmed from the start)
     float value = 0.0f;
 };
 
