@@ -80,6 +80,17 @@ struct DynamicSTFT {
 		return modified ? f*_fftSamples - Sample(0.5) : f*_fftSamples;
 	}
 
+	// Reverse Sampler addition: copies the processing state (buffers, positions, counters) from an
+	// identically configured STFT. The FFT plans and windows are configuration and stay as they are.
+	// Allocation-free when the sizes match (std::vector::assign reuses the capacity).
+	void copyStateFrom(const DynamicSTFT &other) {
+		input = other.input;
+		output = other.output;
+		spectrumBuffer.assign(other.spectrumBuffer.begin(), other.spectrumBuffer.end());
+		_samplesSinceSynthesis = other._samplesSinceSynthesis;
+		_samplesSinceAnalysis = other._samplesSinceAnalysis;
+	}
+
 	void reset(Sample productWeight=1) {
 		input.pos = _blockSamples;
 		output.pos = 0;
